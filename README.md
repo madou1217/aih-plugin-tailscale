@@ -39,6 +39,17 @@ aih plugin enable network.tailscale --accept-permissions
 不想校验签名时直接 `aih plugin install ./tailscale-0.1.1.aih-plugin`。
 需要强制策略时加 `--require-signed`：未签名或公钥未登记都会被拒绝。
 
+### 直接用 Release URL 安装
+
+```sh
+aih plugin install \
+  https://github.com/madou1217/aih-plugin-tailscale/releases/download/v0.1.1/tailscale-0.1.1.aih-plugin \
+  --trust-key https://github.com/madou1217/aih-plugin-tailscale/releases/download/v0.1.1/public.pem \
+  --expect-fingerprint 3960e945419f8f267c3f47b1
+```
+
+只允许 https（本机回环可用 http）；下载在 CLI 侧完成，要求 CLI 与 aih server 同机共享文件系统。
+
 ### 本地开发打包
 
 ```sh
