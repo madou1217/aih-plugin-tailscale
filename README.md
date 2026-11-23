@@ -52,6 +52,20 @@ aih plugin install \
 
 CLI 完全无法访问外网时，加 `--server-download`：CLI 只把 URL 交给服务端，由服务端下载。此时本地摘要校验会被跳过，完整性依赖 https 与包内签名。
 
+### 本地开发的插件
+
+```sh
+# 直接给源码目录：先自动打包，再安装
+aih plugin install ./my-plugin
+
+# 需要签名时
+aih plugin install ./my-plugin \
+  --signing-key keys/private.pem --key-id my-publisher \
+  --trust-key keys/public.pem --expect-fingerprint <指纹>
+```
+
+本地 server 直接读文件；远程 server 看不到本地文件时会自动把包上传过去（带 sha256 校验），不需要先手动 scp。
+
 ### 本地开发打包
 
 ```sh
