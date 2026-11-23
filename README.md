@@ -12,12 +12,12 @@ The plugin reads `tailscale status --json` and distinguishes:
 
 | Mode | Evidence |
 |---|---|
-| `direct-p2p` | an online peer with a non-empty `CurAddr` |
-| `derp-relay` | an online peer that only exposes a `Relay` |
+| `direct-p2p` | an online peer with a non-empty `CurAddr`, or `tailscale ping` reaching a non-DERP endpoint |
+| `derp-relay` | an online peer that only exposes a `Relay`, or ping only reports `via DERP` |
 | `unavailable` | Tailscale not running / not installed |
 | `unknown` | running, but no peer evidence |
 
-`direct-p2p` is only returned with `Peer.CurAddr` evidence. A DERP relay is
+`direct-p2p` is returned only with `Peer.CurAddr` or a `tailscale ping` non-DERP endpoint; A DERP relay is
 never relabeled as direct P2P.
 
 ## Install

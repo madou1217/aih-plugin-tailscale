@@ -118,20 +118,25 @@ def run(cmd, timeout=20, env=None):
         return 127, "", str(exc)
 
 
-def binary_version(binary):
+def socket_args(state):
+    path = str((state.get("config") or {}).get("socketPath") or "").strip()
+    return ["--socket", path] if path else []
+
+
+def binary_version(binary, state):
     if not binary:
         return ""
-    code, out, err = run([binary, "version"], timeout=10)
+    code, out, err = run([binary, *socket_args(state), "version"], timeout=10)
     text = out or err
     if code != 0 or not text:
         return ""
     return text.splitlines()[0].strip()[:96]
 
 
-def read_status(binary):
+def read_status(binary, state):
     if not binary:
         return {}
-    code, out, _ = run([binary, "status", "--json"], timeout=12)
+    code, out, _ = run([binary, *socket_args(state), "status", "--json"], timeout=12)
     if code != 0 or not out:
         return {}
     try:
@@ -141,7 +146,7 @@ def read_status(binary):
         return {}
 
 
-def connectivity_from_status(data, running):
+def connectivity_from_status(data, running, state):
     if not running:
         return {"mode": "unavailable", "confidence": "observed"}
     peers = data.get("Peer") or {}
@@ -169,6 +174,36 @@ def connectivity_from_status(data, running):
             "latencyMs": int(peer.get("LatencyMs") or 0),
             "evidence": {"source": "tailscale status --json", "path": "Peer.CurAddr", "transport": "direct"},
         }
+    # status 的 CurAddr 在部分版本/用户态 daemon 下不会及时刷新；
+    # tailscale ping 直接报告本次探测走的路径，作为更直接的证据。
+    ping_peer = None
+    for peer in peers.values():
+        if isinstance(peer, dict) and peer.get("Online"):
+            ping_peer = peer.get("HostName") or peer.get("DNSName") or (peer.get("TailscaleIPs") or [None])[0]
+            if ping_peer:
+                break
+    if ping_peer:
+        binary = binary_path()
+        code, out, _ = run([binary, *socket_args(state), "ping", "-c", "3", str(ping_peer)], timeout=20)
+        if code == 0:
+            lines = [line.strip() for line in (out or "").splitlines() if "pong from" in line]
+            direct_line = next((line for line in lines if "via DERP" not in line and " via " in line), None)
+            if direct_line:
+                return {
+                    "mode": "direct-p2p",
+                    "confidence": "observed",
+                    "observedAt": observed,
+                    "peerId": str(ping_peer),
+                    "evidence": {"source": "tailscale ping", "path": "non-DERP endpoint", "transport": "direct"},
+                }
+            if any("via DERP" in line for line in lines):
+                return {
+                    "mode": "derp-relay",
+                    "confidence": "observed",
+                    "observedAt": observed,
+                    "peerId": str(ping_peer),
+                    "evidence": {"source": "tailscale ping", "path": "via DERP", "transport": "derp"},
+                }
     if relayed:
         peer, relay = relayed[0]
         return {
@@ -185,10 +220,10 @@ def status_view(state=None):
     state = state or load_state()
     binary = binary_path()
     installed = bool(binary)
-    data = read_status(binary) if installed else {}
+    data = read_status(binary, state) if installed else {}
     backend = str(data.get("BackendState") or "").strip()
     running = backend.lower() == "running"
-    version = binary_version(binary)
+    version = binary_version(binary, state)
     if not installed:
         label = "未安装"
     elif running:
@@ -209,7 +244,7 @@ def status_view(state=None):
         "state": label,
         "version": version,
         "message": message,
-        "connectivity": connectivity_from_status(data, running),
+        "connectivity": connectivity_from_status(data, running, state),
     }
 
 
@@ -237,6 +272,7 @@ def describe():
                         "authKey": {"type": "string", "description": "Tailscale Auth Key"},
                         "hostname": {"type": "string"},
                         "proxyUrl": {"type": "string", "description": "安装/连接使用的 HTTP(S) 或 SOCKS 代理", "x-aih-proxy": True},
+                        "socketPath": {"type": "string", "description": "可选 tailscaled Unix socket 路径；空值使用系统默认 /var/run/tailscaled.socket"},
                     },
                 },
                 "secretFields": ["authKey", "proxyUrl"],
@@ -249,7 +285,7 @@ def describe():
                     "复制 tskey-auth-...，粘贴到下方 authKey 字段。",
                     "安装/连接命令连不上 Tailscale 时，在 proxyUrl 点「使用 AIH 本机代理」再执行配置；浏览器里的管理台链接仍使用浏览器自己的网络/系统代理。",
                     "依次点击「配置 Auth Key」→「安装 tailscale」→「连接 Tailnet」。",
-                    "连接后看状态：Peer.CurAddr 为直连 P2P；只有 Relay 时是 DERP 中继，不会冒充直连。",
+                    "连接后看状态：Peer.CurAddr 或 tailscale ping 的非 DERP endpoint 为直连 P2P；只有 Relay/DERP 时是中继，不会冒充直连。",
                 ],
                 "links": [
                     {"label": "打开 Tailscale Keys 页面", "url": "https://login.tailscale.com/admin/settings/keys"},
@@ -266,7 +302,7 @@ def configure(state, value):
     if isinstance(value, dict):
         if isinstance(value.get("value"), str):
             config["authKey"] = value["value"].strip()
-        for key in ("authKey", "hostname", "proxyUrl"):
+        for key in ("authKey", "hostname", "proxyUrl", "socketPath"):
             if isinstance(value.get(key), str):
                 config[key] = value[key].strip()
     elif isinstance(value, str):
@@ -315,7 +351,7 @@ def enable(state):
     if not binary:
         return {"ok": False, "changed": False, "message": "tailscale 尚未安装", "status": status_view(state)}
     config = state.get("config") or {}
-    args = [binary, "up"]
+    args = [binary, *socket_args(state), "up"]
     hostname = str(config.get("hostname") or "").strip()
     if hostname:
         args += ["--hostname", hostname]
