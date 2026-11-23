@@ -7,6 +7,7 @@ Version is reported, never enforced.
 """
 import json
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,7 @@ STATE_DIR = Path(os.environ.get("AIH_PLUGIN_STATE_DIR", Path.home() / ".ai_home"
 STATE_FILE = STATE_DIR / "state.json"
 DEFAULT_STATE = {"enabled": False, "config": {}, "updatedAt": 0}
 APP_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+AUTOSTART_LABEL = "com.aih.tailscale-userspace"
 
 
 def log(message):
@@ -46,6 +48,15 @@ def save_state(state):
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
     os.chmod(tmp, 0o600)
     tmp.replace(STATE_FILE)
+
+
+def daemon_env():
+    # tailscaled 的控制面连接不等同于安装/登录命令；不能把给 brew/CLI 的
+    # 临时 HTTP 代理注入常驻守护进程，否则代理入口停止后守护进程会持续重连失败。
+    env = dict(os.environ)
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+        env.pop(key, None)
+    return env
 
 
 def proxy_env(state):
@@ -118,9 +129,228 @@ def run(cmd, timeout=20, env=None):
         return 127, "", str(exc)
 
 
-def socket_args(state):
+def effective_socket_path(state):
     path = str((state.get("config") or {}).get("socketPath") or "").strip()
+    if path:
+        return path
+    if sys.platform == "darwin":
+        return str(Path.home() / ".ai_home" / "run" / "tailscale" / "tailscaled.sock")
+    return ""
+
+
+def socket_args(state):
+    path = effective_socket_path(state)
     return ["--socket", path] if path else []
+
+
+def userspace_paths(state):
+    socket_path = effective_socket_path(state) or str(Path.home() / ".ai_home" / "run" / "tailscale" / "tailscaled.sock")
+    socket = Path(socket_path)
+    state_dir = socket.parent
+    return socket, state_dir / "tailscaled.state", state_dir
+
+
+def tailscaled_binary():
+    return shutil.which("tailscaled") or ""
+
+
+def launchd_plist_path():
+    return Path.home() / "Library" / "LaunchAgents" / (AUTOSTART_LABEL + ".plist")
+
+
+def systemd_unit_path():
+    return Path.home() / ".config" / "systemd" / "user" / "aih-tailscaled.service"
+
+
+def windows_startup_path():
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "aih-tailscaled.cmd"
+
+
+def launchd_loaded():
+    if sys.platform != "darwin":
+        return False
+    code, _, _ = run(["launchctl", "print", f"gui/{os.getuid()}/{AUTOSTART_LABEL}"], timeout=5)
+    return code == 0
+
+
+def autostart_enabled(state):
+    if sys.platform == "darwin":
+        return launchd_plist_path().exists() and launchd_loaded()
+    if sys.platform.startswith("linux"):
+        if not systemd_unit_path().exists():
+            return False
+        code, out, _ = run(["systemctl", "--user", "is-enabled", "aih-tailscaled"], timeout=8)
+        return code == 0 and (out or "").strip() == "enabled"
+    if sys.platform.startswith("win"):
+        return windows_startup_path().exists()
+    return False
+
+
+def userspace_command(state):
+    tailscaled = tailscaled_binary()
+    if not tailscaled:
+        return []
+    socket, state_file, state_dir = userspace_paths(state)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(state_dir, 0o700)
+    return [
+        tailscaled,
+        "--tun=userspace-networking",
+        "--socket", str(socket),
+        "--state", str(state_file),
+        "--statedir", str(state_dir),
+        "--port", "41641",
+    ]
+
+
+def daemon_status(state):
+    binary = binary_path()
+    if not binary:
+        return False
+    code, _, _ = run([binary, *socket_args(state), "status", "--json"], timeout=8)
+    return code == 0
+
+
+def stop_manual_userspace(state):
+    socket, _, _ = userspace_paths(state)
+    code, out, _ = run(["ps", "-axo", "pid=,command="], timeout=8)
+    if code != 0:
+        return
+    for line in (out or "").splitlines():
+        if "tailscaled" not in line or "userspace-networking" not in line or str(socket) not in line:
+            continue
+        try:
+            pid = int(line.strip().split(None, 1)[0])
+        except (ValueError, IndexError):
+            continue
+        run(["kill", "-TERM", str(pid)], timeout=5)
+    time.sleep(1)
+
+
+def wait_daemon(state, timeout=12):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if daemon_status(state):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def start_userspace_daemon(state):
+    if daemon_status(state):
+        return True, "守护进程已在运行"
+    command = userspace_command(state)
+    if not command:
+        return False, "未找到 tailscaled，可先安装 tailscale"
+    log_path = Path.home() / ".ai_home" / "logs" / "tailscaled-userspace.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "ab", buffering=0) as log_file:
+        subprocess.Popen(
+            command,
+            stdout=log_file,
+            stderr=log_file,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=daemon_env(),
+        )
+    if wait_daemon(state):
+        return True, "本地守护进程已启动"
+    return False, "本地守护进程启动超时，请查看 ~/.ai_home/logs/tailscaled-userspace.log"
+
+
+def write_launch_agent(state):
+    command = userspace_command(state)
+    if not command:
+        raise RuntimeError("未找到 tailscaled")
+    log_path = Path.home() / ".ai_home" / "logs" / "tailscaled-userspace.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    plist = {
+        "Label": AUTOSTART_LABEL,
+        "ProgramArguments": command,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ProcessType": "Background",
+        "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(log_path),
+        "EnvironmentVariables": {"HOME": str(Path.home())},
+    }
+    path = launchd_plist_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as handle:
+        plistlib.dump(plist, handle)
+    os.chmod(path, 0o644)
+    return path
+
+
+def enable_autostart(state):
+    if not binary_path() or not tailscaled_binary():
+        return {"ok": False, "changed": False, "message": "tailscale 尚未安装", "status": status_view(state)}
+    try:
+        if sys.platform == "darwin":
+            path = write_launch_agent(state)
+            if launchd_loaded():
+                run(["launchctl", "bootout", f"gui/{os.getuid()}", str(path)], timeout=10)
+            stop_manual_userspace(state)
+            code, out, err = run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(path)], timeout=15)
+            if code != 0:
+                return {"ok": False, "changed": False, "message": "launchd 自启安装失败：" + (err or out)[-200:], "status": status_view(state)}
+            run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{AUTOSTART_LABEL}"], timeout=10)
+            if not wait_daemon(state, 15):
+                return {"ok": False, "changed": True, "message": "自启已写入，但守护进程启动超时", "status": status_view(state)}
+            return {"ok": True, "changed": True, "message": "已启用开机自启（用户级 LaunchAgent）", "status": status_view(state)}
+        if sys.platform.startswith("linux"):
+            command = userspace_command(state)
+            if not command:
+                return {"ok": False, "changed": False, "message": "未找到 tailscaled", "status": status_view(state)}
+            unit = "[Unit]\nDescription=AIH Tailscale userspace daemon\n\n[Service]\nExecStart=" + " ".join(command) + "\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n"
+            path = systemd_unit_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(unit)
+            os.chmod(path, 0o644)
+            run(["systemctl", "--user", "daemon-reload"], timeout=10)
+            code, out, err = run(["systemctl", "--user", "enable", "--now", "aih-tailscaled"], timeout=20)
+            if code != 0:
+                return {"ok": False, "changed": False, "message": "systemd 自启安装失败：" + (err or out)[-200:], "status": status_view(state)}
+            return {"ok": True, "changed": True, "message": "已启用用户级 systemd 自启", "status": status_view(state)}
+        if sys.platform.startswith("win"):
+            command = userspace_command(state)
+            if not command:
+                return {"ok": False, "changed": False, "message": "未找到 tailscaled", "status": status_view(state)}
+            path = windows_startup_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("start \"\" /min " + " ".join('"' + part + '"' for part in command) + "\r\n")
+            return {"ok": True, "changed": True, "message": "已写入 Windows 登录启动项；下次登录生效", "status": status_view(state)}
+        return {"ok": False, "changed": False, "message": "当前平台不支持插件自启", "status": status_view(state)}
+    except (OSError, RuntimeError) as exc:
+        return {"ok": False, "changed": False, "message": "自启配置失败：" + str(exc)[:200], "status": status_view(state)}
+
+
+def disable_autostart(state):
+    if sys.platform == "darwin":
+        path = launchd_plist_path()
+        if launchd_loaded():
+            run(["launchctl", "bootout", f"gui/{os.getuid()}", str(path)], timeout=10)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return {"ok": True, "changed": True, "message": "已取消开机自启", "status": status_view(state)}
+    if sys.platform.startswith("linux"):
+        run(["systemctl", "--user", "disable", "--now", "aih-tailscaled"], timeout=15)
+        try:
+            systemd_unit_path().unlink()
+        except OSError:
+            pass
+        run(["systemctl", "--user", "daemon-reload"], timeout=10)
+        return {"ok": True, "changed": True, "message": "已取消用户级自启", "status": status_view(state)}
+    if sys.platform.startswith("win"):
+        try:
+            windows_startup_path().unlink()
+        except OSError:
+            pass
+        return {"ok": True, "changed": True, "message": "已移除 Windows 登录启动项", "status": status_view(state)}
+    return {"ok": False, "changed": False, "message": "当前平台不支持插件自启", "status": status_view(state)}
 
 
 def binary_version(binary, state):
@@ -246,6 +476,7 @@ def status_view(state=None):
         "state": label,
         "version": version,
         "message": message,
+        "autostart": autostart_enabled(state),
         "connectivity": connectivity_from_status(data, running, state),
     }
 
@@ -265,6 +496,8 @@ def describe():
                 {"id": "configure", "label": "配置 Auth Key / 代理", "inputKind": "secret", "confirmation": "required"},
                 {"id": "enable", "label": "连接 Tailnet", "confirmation": "required"},
                 {"id": "disable", "label": "断开 Tailnet", "confirmation": "required"},
+                {"id": "autostart-enable", "label": "开机自启（插件守护进程）", "confirmation": "required"},
+                {"id": "autostart-disable", "label": "取消开机自启", "confirmation": "required"},
                 {"id": "probe", "label": "探测连通路径", "confirmation": "none"},
             ],
             "config": {
@@ -287,6 +520,7 @@ def describe():
                     "复制 tskey-auth-...，粘贴到下方 authKey 字段。",
                     "安装/连接命令连不上 Tailscale 时，在 proxyUrl 点「使用 AIH 本机代理」再执行配置；浏览器里的管理台链接仍使用浏览器自己的网络/系统代理。",
                     "依次点击「配置 Auth Key」→「安装 tailscale」→「连接 Tailnet」。",
+                    "需要登录后自动恢复时，点击「开机自启（插件守护进程）」；插件会安装用户级 LaunchAgent/systemd 单元并管理 tailscaled。",
                     "连接后看状态：Peer.CurAddr 或 tailscale ping 的非 DERP endpoint 为直连 P2P；只有 Relay/DERP 时是中继，不会冒充直连。",
                 ],
                 "links": [
@@ -360,13 +594,21 @@ def enable(state):
     env = proxy_env(state)
     auth_key = str(config.get("authKey") or "").strip()
     key_file = None
+    if not daemon_status(state):
+        if autostart_enabled(state):
+            if sys.platform == "darwin":
+                run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{AUTOSTART_LABEL}"], timeout=10)
+            elif sys.platform.startswith("linux"):
+                run(["systemctl", "--user", "start", "aih-tailscaled"], timeout=15)
+            wait_daemon(state, 12)
+        if not daemon_status(state):
+            started, detail = start_userspace_daemon(state)
+            if not started:
+                return {"ok": False, "changed": False, "message": detail, "status": status_view(state)}
     if auth_key:
-        if on_linux():
-            # file: 形式让 key 不出现在进程命令行；--reset 让上一轮的 hostname 等设置可覆盖。
-            key_file = writable_auth_key_file(auth_key)
-            args += ["--auth-key=file:" + str(key_file), "--reset"]
-        else:
-            env["TS_AUTHKEY"] = auth_key
+        # file: 形式让 key 不出现在进程命令行；--reset 让上一轮的 hostname 等设置可覆盖。
+        key_file = writable_auth_key_file(auth_key)
+        args += ["--auth-key=file:" + str(key_file), "--reset"]
     try:
         if on_linux():
             if not sudo_available():
@@ -436,6 +678,10 @@ def operate(action, value):
         return enable(state)
     if action == "disable":
         return disable(state)
+    if action == "autostart-enable":
+        return enable_autostart(state)
+    if action == "autostart-disable":
+        return disable_autostart(state)
     if action == "probe":
         return {"ok": True, "changed": False, "message": "探测完成", "status": status_view(state)}
     return {"ok": False, "changed": False, "message": f"未声明的操作：{action}"}

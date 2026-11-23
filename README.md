@@ -95,6 +95,15 @@ then offers **「使用 AIH 本机代理」**, which starts a local AIH proxy en
 fills the authenticated proxy URL into the config without the user searching
 for a proxy manually.
 
+## Autostart
+
+The plugin declares `autostart-enable` / `autostart-disable` operations and an
+`autostart` status flag. On macOS it installs a user LaunchAgent for
+`tailscaled --tun=userspace-networking`; on Linux a user-level systemd unit; on
+Windows a login Startup entry. The daemon environment deliberately excludes the
+temporary install/connect `proxyUrl`, so stopping that proxy does not break the
+resident control-plane connection.
+
 ## Configure
 
 ```json
