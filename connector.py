@@ -62,6 +62,38 @@ def proxy_env(state):
     }
 
 
+def on_linux():
+    # tailscaled 在 Linux 上由 root 管理；改 prefs（up/down）需要 root 或 operator。
+    # enable 直接走 sudo -n，避免无 key 时 `tailscale up` 阻塞等待登录 URL。
+    return sys.platform.startswith("linux")
+
+
+def sudo_available():
+    return bool(shutil.which("sudo"))
+
+
+def sudo_refused(text):
+    return "sudo:" in (text or "")
+
+
+def writable_auth_key_file(auth_key):
+    """把 auth key 落到 0600 临时文件，供 `--auth-key=file:` 读取，避免出现在命令行。"""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    path = STATE_DIR / "authkey.tmp"
+    path.write_text(auth_key)
+    os.chmod(path, 0o600)
+    return path
+
+
+def run_with_sudo(args, timeout, env=None):
+    """Linux 下以 `sudo -n` 执行；配置了代理时通过 `sudo env` 透传。"""
+    prefix = [shutil.which("sudo") or "sudo", "-n"]
+    if env:
+        prefix += ["env"] + [f"{name}={value}" for name, value in env.items()]
+    return run(prefix + args, timeout=timeout)
+
+
 def command_output(out, err, limit=20):
     text = (err or out or "").strip()
     if not text:
@@ -250,6 +282,8 @@ def install(state):
         return {"ok": True, "changed": False, "message": "tailscale 已安装", "status": status_view(state)}
     brew = shutil.which("brew")
     if not brew:
+        if on_linux():
+            return {"ok": False, "changed": False, "message": "Linux 请用发行版包管理器或官方静态包安装 tailscale 后重试"}
         return {"ok": False, "changed": False, "message": "未找到 Homebrew；请手动安装 tailscale 后重试"}
     code, out, err = run([brew, "install", "tailscale"], timeout=600, env=proxy_env(state))
     output = command_output(out, err)
@@ -287,9 +321,27 @@ def enable(state):
         args += ["--hostname", hostname]
     env = proxy_env(state)
     auth_key = str(config.get("authKey") or "").strip()
+    key_file = None
     if auth_key:
-        env["TS_AUTHKEY"] = auth_key
-    code, out, err = run(args, timeout=90, env=env)
+        if on_linux():
+            # file: 形式让 key 不出现在进程命令行；--reset 让上一轮的 hostname 等设置可覆盖。
+            key_file = writable_auth_key_file(auth_key)
+            args += ["--auth-key=file:" + str(key_file), "--reset"]
+        else:
+            env["TS_AUTHKEY"] = auth_key
+    try:
+        if on_linux():
+            if not sudo_available():
+                return {"ok": False, "changed": False, "message": "需要管理员权限：请在终端执行 sudo tailscale up 后重试", "status": status_view(state)}
+            code, out, err = run_with_sudo(args, timeout=90, env=env)
+        else:
+            code, out, err = run(args, timeout=90, env=env)
+    finally:
+        if key_file is not None:
+            try:
+                key_file.unlink()
+            except OSError:
+                pass
     output = command_output(out, err)
     if code != 0:
         text = (err or out).strip()
@@ -297,7 +349,9 @@ def enable(state):
         # Login URLs are safe to surface; keys never are.
         message = "连接失败；如需登录，请在终端执行 tailscale up 完成授权"
         links = []
-        if "https://" in text:
+        if on_linux() and sudo_refused(text):
+            message = "需要管理员权限：请在终端执行 sudo tailscale up，或为当前用户配置免密 sudo 后重试"
+        elif "https://" in text:
             last = text.splitlines()[-1].strip()
             url = last[last.find("https://"):].split()[0].strip("\"'")
             message = "需要登录授权：请打开下方登录链接完成授权后重试"
@@ -314,11 +368,19 @@ def disable(state):
     if not binary:
         return {"ok": False, "changed": False, "message": "tailscale 尚未安装", "status": status_view(state)}
     before = status_view(state).get("running")
-    code, out, err = run([binary, "down"], timeout=30, env=proxy_env(state))
+    env = proxy_env(state)
+    code, out, err = run([binary, "down"], timeout=30, env=env)
+    if code != 0 and on_linux() and sudo_available():
+        # operator 已配置时普通用户即可 down；未配置时退回 sudo -n。
+        code, out, err = run_with_sudo([binary, "down"], timeout=30, env=env)
     output = command_output(out, err)
     if code != 0:
         log(err or out)
-        return {"ok": False, "changed": False, "message": "断开失败", "output": output, "status": status_view(state)}
+        message = "断开失败"
+        text = err or out
+        if on_linux() and (sudo_refused(text) or "Access denied" in text):
+            message = "需要管理员权限：请在终端执行 sudo tailscale down，或为当前用户配置免密 sudo 后重试"
+        return {"ok": False, "changed": False, "message": message, "output": output, "status": status_view(state)}
     state["enabled"] = False
     save_state(state)
     return {"ok": True, "changed": bool(before), "message": "已断开 Tailnet", "status": status_view(state)}

@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "protocolVersion": 1,
   "pluginId": "network.tailscale",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "engines": {
     "aih": ">=0.0.0"
   },

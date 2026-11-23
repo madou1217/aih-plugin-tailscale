@@ -106,13 +106,25 @@ command environment. It does not transparently re-route an already-running
 Tailscale daemon or a browser login page; those need system/browser proxy
 configuration. Prefer the auth-key flow so no interactive browser is needed.
 
-`authKey` is a secret field and is passed to `tailscale up` through
-`TS_AUTHKEY`, not argv. State is stored at
+`authKey` is a secret field. On macOS it is passed to `tailscale up` through
+`TS_AUTHKEY`; on Linux it is written to a 0600 temporary file and passed as
+`--auth-key=file:<path>`, so it never appears in argv. State is stored at
 `$HOME/.ai_home/plugin-state/network.tailscale/` with 0600 permissions.
+
+## Linux notes
+
+`tailscaled` is managed by root on Linux, so `enable`/`disable` use
+`sudo -n tailscale up/down` when the unprivileged call is refused. A
+passwordless sudo rule for the current user is required; without one the
+plugin returns an explicit "需要管理员权限" message instead of claiming success.
+Install `tailscale` with the distribution package manager or the official
+static package first — `install` only automates Homebrew on macOS.
 
 ## Boundaries
 
-- `install` uses Homebrew when available; no `sudo` is attempted.
+- `install` uses Homebrew on macOS; on Linux it asks you to install the
+  package yourself. `enable`/`disable` may use `sudo -n`, never an interactive
+  password prompt.
 - `enable` runs `tailscale up`; if login is required, the result returns a
   structured link so the WebUI can open it (the browser uses its own network).
 - The WebUI never silently changes system/browser proxy settings.
