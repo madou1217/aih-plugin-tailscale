@@ -81,11 +81,30 @@ aih plugin pack . tailscale-0.1.0.aih-plugin \
   --signing-key keys/private.pem --key-id aih-plugins
 ```
 
+## WebUI setup guide
+
+The plugin declares a `setup` block in `describe`:
+
+- exact steps for creating a Tailscale auth key (Settings → Keys);
+- links to the Tailscale keys page and auth-key documentation;
+- a note that browser links use the browser's own network, while install/connect
+  commands can use the `proxyUrl` field.
+
+The `proxyUrl` schema property is marked `x-aih-proxy`; the AIH connector panel
+then offers **「使用 AIH 本机代理」**, which starts a local AIH proxy entry and
+fills the authenticated proxy URL into the config without the user searching
+for a proxy manually.
+
 ## Configure
 
 ```json
-{ "authKey": "tskey-auth-...", "hostname": "aih-host" }
+{ "authKey": "tskey-auth-...", "hostname": "aih-host", "proxyUrl": "http://aih:...@127.0.0.1:..." }
 ```
+
+`proxyUrl` is used for Homebrew install/uninstall and the `tailscale up/down`
+command environment. It does not transparently re-route an already-running
+Tailscale daemon or a browser login page; those need system/browser proxy
+configuration. Prefer the auth-key flow so no interactive browser is needed.
 
 `authKey` is a secret field and is passed to `tailscale up` through
 `TS_AUTHKEY`, not argv. State is stored at
@@ -94,6 +113,7 @@ aih plugin pack . tailscale-0.1.0.aih-plugin \
 ## Boundaries
 
 - `install` uses Homebrew when available; no `sudo` is attempted.
-- `enable` runs `tailscale up`; if login is required, the returned message
-  points the user to finish authorization in a terminal.
+- `enable` runs `tailscale up`; if login is required, the result returns a
+  structured link so the WebUI can open it (the browser uses its own network).
+- The WebUI never silently changes system/browser proxy settings.
 - No Electron/WebView/CDP.

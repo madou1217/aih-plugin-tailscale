@@ -204,10 +204,25 @@ def describe():
                     "properties": {
                         "authKey": {"type": "string", "description": "Tailscale Auth Key"},
                         "hostname": {"type": "string"},
-                        "proxyUrl": {"type": "string", "description": "安装/连接使用的 HTTP(S) 或 SOCKS 代理"},
+                        "proxyUrl": {"type": "string", "description": "安装/连接使用的 HTTP(S) 或 SOCKS 代理", "x-aih-proxy": True},
                     },
                 },
                 "secretFields": ["authKey", "proxyUrl"],
+            },
+            "setup": {
+                "summary": "使用 Tailscale Auth Key 连接 Tailnet；密钥只提交给本地插件，状态和日志不回显。",
+                "steps": [
+                    "打开 Tailscale 管理台 → Settings → Keys（使用下方链接）。",
+                    "Generate auth key：多台节点选 Reusable，按需设置过期时间和 tags；只需要短时节点可选 Ephemeral。",
+                    "复制 tskey-auth-...，粘贴到下方 authKey 字段。",
+                    "安装/连接命令连不上 Tailscale 时，在 proxyUrl 点「使用 AIH 本机代理」再执行配置；浏览器里的管理台链接仍使用浏览器自己的网络/系统代理。",
+                    "依次点击「配置 Auth Key」→「安装 tailscale」→「连接 Tailnet」。",
+                    "连接后看状态：Peer.CurAddr 为直连 P2P；只有 Relay 时是 DERP 中继，不会冒充直连。",
+                ],
+                "links": [
+                    {"label": "打开 Tailscale Keys 页面", "url": "https://login.tailscale.com/admin/settings/keys"},
+                    {"label": "Tailscale Auth Key 文档", "url": "https://tailscale.com/kb/1085/auth-keys"},
+                ],
             },
             "connectivityModes": ["direct-p2p", "derp-relay", "unavailable", "unknown"],
         },
@@ -281,9 +296,14 @@ def enable(state):
         log(text)
         # Login URLs are safe to surface; keys never are.
         message = "连接失败；如需登录，请在终端执行 tailscale up 完成授权"
+        links = []
         if "https://" in text:
-            message = "需要登录授权：" + text.splitlines()[-1][:200]
-        return {"ok": False, "changed": False, "message": message, "output": output, "status": status_view(state)}
+            last = text.splitlines()[-1].strip()
+            url = last[last.find("https://"):].split()[0].strip("\"'")
+            message = "需要登录授权：请打开下方登录链接完成授权后重试"
+            if url:
+                links = [{"label": "打开 Tailscale 登录授权", "url": url}]
+        return {"ok": False, "changed": False, "message": message, "output": output, "links": links, "status": status_view(state)}
     state["enabled"] = True
     save_state(state)
     return {"ok": True, "changed": True, "message": "已连接 Tailnet", "status": status_view(state)}
