@@ -48,6 +48,28 @@ def save_state(state):
     tmp.replace(STATE_FILE)
 
 
+def proxy_env(state):
+    proxy = str((state.get("config") or {}).get("proxyUrl") or "").strip()
+    if not proxy:
+        return {}
+    return {
+        "HTTPS_PROXY": proxy,
+        "HTTP_PROXY": proxy,
+        "ALL_PROXY": proxy,
+        "https_proxy": proxy,
+        "http_proxy": proxy,
+        "all_proxy": proxy,
+    }
+
+
+def command_output(out, err, limit=20):
+    text = (err or out or "").strip()
+    if not text:
+        return []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-limit:]
+
+
 def binary_path():
     found = shutil.which("tailscale")
     if found:
@@ -171,7 +193,7 @@ def describe():
             "operations": [
                 {"id": "install", "label": "安装 tailscale", "confirmation": "required"},
                 {"id": "uninstall", "label": "卸载 tailscale", "confirmation": "required"},
-                {"id": "configure", "label": "配置 Auth Key", "inputKind": "secret", "confirmation": "required"},
+                {"id": "configure", "label": "配置 Auth Key / 代理", "inputKind": "secret", "confirmation": "required"},
                 {"id": "enable", "label": "连接 Tailnet", "confirmation": "required"},
                 {"id": "disable", "label": "断开 Tailnet", "confirmation": "required"},
                 {"id": "probe", "label": "探测连通路径", "confirmation": "none"},
@@ -182,9 +204,10 @@ def describe():
                     "properties": {
                         "authKey": {"type": "string", "description": "Tailscale Auth Key"},
                         "hostname": {"type": "string"},
+                        "proxyUrl": {"type": "string", "description": "安装/连接使用的 HTTP(S) 或 SOCKS 代理"},
                     },
                 },
-                "secretFields": ["authKey"],
+                "secretFields": ["authKey", "proxyUrl"],
             },
             "connectivityModes": ["direct-p2p", "derp-relay", "unavailable", "unknown"],
         },
@@ -196,7 +219,7 @@ def configure(state, value):
     if isinstance(value, dict):
         if isinstance(value.get("value"), str):
             config["authKey"] = value["value"].strip()
-        for key in ("authKey", "hostname"):
+        for key in ("authKey", "hostname", "proxyUrl"):
             if isinstance(value.get(key), str):
                 config[key] = value[key].strip()
     elif isinstance(value, str):
@@ -213,11 +236,13 @@ def install(state):
     brew = shutil.which("brew")
     if not brew:
         return {"ok": False, "changed": False, "message": "未找到 Homebrew；请手动安装 tailscale 后重试"}
-    code, out, err = run([brew, "install", "tailscale"], timeout=600)
+    code, out, err = run([brew, "install", "tailscale"], timeout=600, env=proxy_env(state))
+    output = command_output(out, err)
     if code != 0:
         log(err or out)
-        return {"ok": False, "changed": False, "message": "Homebrew 安装失败，详见服务日志"}
-    return {"ok": True, "changed": True, "message": "tailscale 安装完成", "status": status_view(state)}
+        reason = output[-1] if output else "Homebrew 安装失败"
+        return {"ok": False, "changed": False, "message": "Homebrew 安装失败：" + reason[:200], "output": output}
+    return {"ok": True, "changed": True, "message": "tailscale 安装完成", "output": output, "status": status_view(state)}
 
 
 def uninstall(state):
@@ -227,11 +252,13 @@ def uninstall(state):
     brew = shutil.which("brew")
     if not brew:
         return {"ok": False, "changed": False, "message": "未找到 Homebrew；请手动卸载 tailscale"}
-    code, out, err = run([brew, "uninstall", "tailscale"], timeout=300)
+    code, out, err = run([brew, "uninstall", "tailscale"], timeout=300, env=proxy_env(state))
+    output = command_output(out, err)
     if code != 0:
         log(err or out)
-        return {"ok": False, "changed": False, "message": "Homebrew 卸载失败，详见服务日志"}
-    return {"ok": True, "changed": True, "message": "tailscale 已卸载", "status": status_view(state)}
+        reason = output[-1] if output else "Homebrew 卸载失败"
+        return {"ok": False, "changed": False, "message": "Homebrew 卸载失败：" + reason[:200], "output": output}
+    return {"ok": True, "changed": True, "message": "tailscale 已卸载", "output": output, "status": status_view(state)}
 
 
 def enable(state):
@@ -243,11 +270,12 @@ def enable(state):
     hostname = str(config.get("hostname") or "").strip()
     if hostname:
         args += ["--hostname", hostname]
-    env = {}
+    env = proxy_env(state)
     auth_key = str(config.get("authKey") or "").strip()
     if auth_key:
         env["TS_AUTHKEY"] = auth_key
     code, out, err = run(args, timeout=90, env=env)
+    output = command_output(out, err)
     if code != 0:
         text = (err or out).strip()
         log(text)
@@ -255,7 +283,7 @@ def enable(state):
         message = "连接失败；如需登录，请在终端执行 tailscale up 完成授权"
         if "https://" in text:
             message = "需要登录授权：" + text.splitlines()[-1][:200]
-        return {"ok": False, "changed": False, "message": message, "status": status_view(state)}
+        return {"ok": False, "changed": False, "message": message, "output": output, "status": status_view(state)}
     state["enabled"] = True
     save_state(state)
     return {"ok": True, "changed": True, "message": "已连接 Tailnet", "status": status_view(state)}
@@ -266,10 +294,11 @@ def disable(state):
     if not binary:
         return {"ok": False, "changed": False, "message": "tailscale 尚未安装", "status": status_view(state)}
     before = status_view(state).get("running")
-    code, out, err = run([binary, "down"], timeout=30)
+    code, out, err = run([binary, "down"], timeout=30, env=proxy_env(state))
+    output = command_output(out, err)
     if code != 0:
         log(err or out)
-        return {"ok": False, "changed": False, "message": "断开失败，详见服务日志", "status": status_view(state)}
+        return {"ok": False, "changed": False, "message": "断开失败", "output": output, "status": status_view(state)}
     state["enabled"] = False
     save_state(state)
     return {"ok": True, "changed": bool(before), "message": "已断开 Tailnet", "status": status_view(state)}

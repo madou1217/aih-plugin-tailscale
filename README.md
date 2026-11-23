@@ -27,24 +27,24 @@ never relabeled as direct P2P.
 ### 从 Release 安装（推荐）
 
 ```sh
-gh release download v0.1.1 -R madou1217/aih-plugin-tailscale
+gh release download v0.1.3 -R madou1217/aih-plugin-tailscale
 shasum -a 256 -c SHA256SUMS
 # 一步：登记公钥并安装；指纹必须与 Release 说明一致
-aih plugin install ./tailscale-0.1.1.aih-plugin \
+aih plugin install ./tailscale-0.1.3.aih-plugin \
   --trust-key ./public.pem \
   --expect-fingerprint 3960e945419f8f267c3f47b1
 aih plugin enable network.tailscale --accept-permissions
 ```
 
-不想校验签名时直接 `aih plugin install ./tailscale-0.1.1.aih-plugin`。
+不想校验签名时直接 `aih plugin install ./tailscale-0.1.3.aih-plugin`。
 需要强制策略时加 `--require-signed`：未签名或公钥未登记都会被拒绝。
 
 ### 直接用 Release URL 安装
 
 ```sh
 aih plugin install \
-  https://github.com/madou1217/aih-plugin-tailscale/releases/download/v0.1.1/tailscale-0.1.1.aih-plugin \
-  --trust-key https://github.com/madou1217/aih-plugin-tailscale/releases/download/v0.1.1/public.pem \
+  https://github.com/madou1217/aih-plugin-tailscale/releases/download/v0.1.3/tailscale-0.1.3.aih-plugin \
+  --trust-key https://github.com/madou1217/aih-plugin-tailscale/releases/download/v0.1.3/public.pem \
   --expect-fingerprint 3960e945419f8f267c3f47b1
 ```
 
