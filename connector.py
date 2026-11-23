@@ -233,6 +233,8 @@ def status_view(state=None):
     else:
         label = "已停止"
     message = ""
+    if running and str((state.get("config") or {}).get("authKey") or "").strip():
+        message = "已连接 Tailnet；Auth Key 已保存（不回显）"
     if not installed:
         message = "未找到 tailscale，可执行 install 通过 Homebrew 安装"
     elif not running:
