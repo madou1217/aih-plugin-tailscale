@@ -50,6 +50,8 @@ aih plugin install \
 
 只允许 https（本机回环可用 http）。CLI 会先下载用于摘要校验；如果服务端看不到这个本地文件（远程 server 或 SSH 隧道），它会按同一 URL 自行下载并核对 sha256。服务端需要能直连公网 https，且不走系统代理。
 
+CLI 完全无法访问外网时，加 `--server-download`：CLI 只把 URL 交给服务端，由服务端下载。此时本地摘要校验会被跳过，完整性依赖 https 与包内签名。
+
 ### 本地开发打包
 
 ```sh
